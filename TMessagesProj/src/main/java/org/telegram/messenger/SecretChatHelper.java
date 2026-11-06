@@ -769,8 +769,15 @@ public class SecretChatHelper extends BaseController {
                             });
                         });
                     } else {
+                        boolean rejectedFile = encryptedFile != null && error.code == 400;
+                        if (rejectedFile) {
+                            fillRejectedSecretSequence(chat, newMsgObj);
+                        }
                         getMessagesStorage().markMessageAsSendError(newMsgObj, 0);
                         AndroidUtilities.runOnUIThread(() -> {
+                            if (rejectedFile) {
+                                newMsgObj.seq_in = newMsgObj.seq_out = 0;
+                            }
                             newMsgObj.send_state = MessageObject.MESSAGE_SEND_STATE_SEND_ERROR;
                             getNotificationCenter().postNotificationName(NotificationCenter.messageSendError, newMsgObj.id);
                             getSendMessagesHelper().processSentMessage(newMsgObj.id);
@@ -782,6 +789,23 @@ public class SecretChatHelper extends BaseController {
                 FileLog.e(e);
             }
         });
+    }
+
+    // A rejected encrypted file still used its out sequence number, so the peer waits on that slot.
+    // Fill it with a Noop reusing the same seq, and drop the message's seq so a retry gets a new one.
+    private void fillRejectedSecretSequence(TLRPC.EncryptedChat chat, TLRPC.Message rejected) {
+        if (!(chat instanceof TLRPC.TL_encryptedChat)) {
+            return;
+        }
+        int seqIn = rejected.seq_in, seqOut = rejected.seq_out;
+        getMessagesStorage().clearMessageSeq(rejected.id);
+        TLRPC.TL_decryptedMessageService req = new TLRPC.TL_decryptedMessageService();
+        req.action = new TLRPC.TL_decryptedMessageActionNoop();
+        TLRPC.TL_messageService filler = createServiceSecretMessage(chat, req.action);
+        req.random_id = filler.random_id;
+        filler.seq_in = seqIn;
+        filler.seq_out = seqOut;
+        performSendEncryptedRequest(req, filler, chat, null, null, null);
     }
 
     private void applyPeerLayer(TLRPC.EncryptedChat chat, int newPeerLayer) {

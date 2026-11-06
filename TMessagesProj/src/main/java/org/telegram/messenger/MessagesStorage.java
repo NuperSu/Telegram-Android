@@ -13819,6 +13819,16 @@ public class MessagesStorage extends BaseController {
         });
     }
 
+    public void clearMessageSeq(int mid) {
+        storageQueue.postRunnable(() -> {
+            try {
+                database.executeFast("DELETE FROM messages_seq WHERE mid = " + mid).stepThis().dispose();
+            } catch (Exception e) {
+                checkSQLException(e);
+            }
+        });
+    }
+
     private long[] updateMessageStateAndIdInternal(long randomId, long dialogId, Integer _oldId, int newId, int date, int scheduled, int newTopicId) {
         SQLiteCursor cursor = null;
         int oldMessageId;
