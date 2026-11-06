@@ -591,6 +591,10 @@ public class SecretChatHelper extends BaseController {
     }
 
     protected void performSendEncryptedRequest(TLRPC.DecryptedMessage req, TLRPC.Message newMsgObj, TLRPC.EncryptedChat chat, TLRPC.InputEncryptedFile encryptedFile, String originalPath, MessageObject newMsg) {
+        performSendEncryptedRequest(req, newMsgObj, chat, encryptedFile, originalPath, newMsg, null);
+    }
+
+    protected void performSendEncryptedRequest(TLRPC.DecryptedMessage req, TLRPC.Message newMsgObj, TLRPC.EncryptedChat chat, TLRPC.InputEncryptedFile encryptedFile, String originalPath, MessageObject newMsg, java.util.function.Consumer<Boolean> onResult) {
         if (req == null || chat.auth_key == null || chat instanceof TLRPC.TL_encryptedChatRequested || chat instanceof TLRPC.TL_encryptedChatWaiting) {
             return;
         }
@@ -784,29 +788,76 @@ public class SecretChatHelper extends BaseController {
                             getSendMessagesHelper().removeFromSendingMessages(newMsgObj.id, false);
                         });
                     }
+                    if (onResult != null) {
+                        onResult.accept(error == null);
+                    }
                 }, ConnectionsManager.RequestFlagInvokeAfter);
             } catch (Exception e) {
                 FileLog.e(e);
+                if (onResult != null) {
+                    onResult.accept(false);
+                }
             }
         });
     }
 
     // A rejected encrypted file still used its out sequence number, so the peer waits on that slot.
-    // Fill it with a Noop reusing the same seq, and drop the message's seq so a retry gets a new one.
+    // The slot is filled by a durable Noop (pending task 26) that is retransmitted until acknowledged.
     private void fillRejectedSecretSequence(TLRPC.EncryptedChat chat, TLRPC.Message rejected) {
         if (!(chat instanceof TLRPC.TL_encryptedChat)) {
             return;
         }
         int seqIn = rejected.seq_in, seqOut = rejected.seq_out;
-        getMessagesStorage().clearMessageSeq(rejected.id);
+        long fillerRandomId = Utilities.random.nextLong();
+        getMessagesStorage().replaceRejectedSecretSequence(rejected.id, chat.id, seqIn, seqOut, fillerRandomId, taskId -> sendRejectedSecretFiller(taskId, chat.id, seqIn, seqOut, fillerRandomId, 0));
+    }
+
+    public void resumeRejectedSecretSequence(long taskId, int chatId, int seqIn, int seqOut, long fillerRandomId) {
+        Utilities.stageQueue.postRunnable(() -> sendRejectedSecretFiller(taskId, chatId, seqIn, seqOut, fillerRandomId, 0));
+    }
+
+    private void sendRejectedSecretFiller(long taskId, int chatId, int seqIn, int seqOut, long randomId, int attempt) {
+        TLRPC.EncryptedChat chat = getMessagesController().getEncryptedChat(chatId);
+        if (chat instanceof TLRPC.TL_encryptedChatDiscarded) {
+            finishRejectedSecretFiller(taskId);
+            return;
+        }
+        if (!(chat instanceof TLRPC.TL_encryptedChat) || chat.auth_key == null) {
+            scheduleRejectedSecretFiller(taskId, chatId, seqIn, seqOut, randomId, attempt);
+            return;
+        }
         TLRPC.TL_decryptedMessageService req = new TLRPC.TL_decryptedMessageService();
         req.action = new TLRPC.TL_decryptedMessageActionNoop();
+        req.random_id = randomId;
         TLRPC.TL_messageService filler = createServiceSecretMessage(chat, req.action);
-        req.random_id = filler.random_id;
+        filler.random_id = randomId;
         filler.seq_in = seqIn;
         filler.seq_out = seqOut;
-        performSendEncryptedRequest(req, filler, chat, null, null, null);
+        performSendEncryptedRequest(req, filler, chat, null, null, null, ok -> {
+            if (ok) {
+                finishRejectedSecretFiller(taskId);
+            } else {
+                scheduleRejectedSecretFiller(taskId, chatId, seqIn, seqOut, randomId, attempt);
+            }
+        });
     }
+
+    private void scheduleRejectedSecretFiller(long taskId, int chatId, int seqIn, int seqOut, long randomId, int attempt) {
+        if (attempt >= REJECTED_FILLER_MAX_ATTEMPTS) {
+            FileLog.e("secret sequence " + seqOut + " filler not acknowledged after " + attempt + " attempts");
+            finishRejectedSecretFiller(taskId);
+            return;
+        }
+        Utilities.stageQueue.postRunnable(() -> sendRejectedSecretFiller(taskId, chatId, seqIn, seqOut, randomId, attempt + 1), 5000);
+    }
+
+    private void finishRejectedSecretFiller(long taskId) {
+        if (taskId != 0) {
+            getMessagesStorage().removePendingTask(taskId);
+        }
+    }
+
+    private static final int REJECTED_FILLER_MAX_ATTEMPTS = 10;
 
     private void applyPeerLayer(TLRPC.EncryptedChat chat, int newPeerLayer) {
         int currentPeerLayer = AndroidUtilities.getPeerLayerVersion(chat.layer);

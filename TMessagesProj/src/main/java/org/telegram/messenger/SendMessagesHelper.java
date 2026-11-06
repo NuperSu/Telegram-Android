@@ -1713,6 +1713,14 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
     }
 
     public boolean retrySendMessage(MessageObject messageObject, boolean unsent, long payStars) {
+        if (!unsent && messageObject.getId() < 0 && DialogObject.isEncryptedDialog(messageObject.getDialogId())) {
+            getMessagesStorage().loadMessageSeqForRetry(messageObject.messageOwner, () -> retrySendMessageInternal(messageObject, false, payStars));
+            return true;
+        }
+        return retrySendMessageInternal(messageObject, unsent, payStars);
+    }
+
+    private boolean retrySendMessageInternal(MessageObject messageObject, boolean unsent, long payStars) {
         if (messageObject.getId() >= 0) {
             if (messageObject.isEditing()) {
                 editMessage(messageObject, null, null, null, null, null, null, true, messageObject.hasMediaSpoilers(), messageObject);

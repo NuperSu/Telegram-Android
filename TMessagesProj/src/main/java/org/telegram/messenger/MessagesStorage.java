@@ -1002,6 +1002,12 @@ public class MessagesStorage extends BaseController {
                                 }
                                 break;
                             }
+                            case 26: {
+                                int chatId = data.readInt32(false), seqIn = data.readInt32(false), seqOut = data.readInt32(false);
+                                long fillerRandomId = data.readInt64(false);
+                                Utilities.stageQueue.postRunnable(() -> getSecretChatHelper().resumeRejectedSecretSequence(taskId, chatId, seqIn, seqOut, fillerRandomId));
+                                break;
+                            }
                             case 1: {
                                 long channelId = data.readInt32(false);
                                 int newDialogType = data.readInt32(false);
@@ -13819,13 +13825,70 @@ public class MessagesStorage extends BaseController {
         });
     }
 
-    public void clearMessageSeq(int mid) {
+    // Stores a durable Noop (pending task 26) for a rejected media sequence and detaches the message from that slot, in one transaction.
+    public void replaceRejectedSecretSequence(int mid, int chatId, int seqIn, int seqOut, long fillerRandomId, java.util.function.LongConsumer onStored) {
         storageQueue.postRunnable(() -> {
+            long taskId = 0;
+            NativeByteBuffer data = null;
+            boolean savepoint = false;
             try {
+                data = new NativeByteBuffer(24);
+                data.writeInt32(26);
+                data.writeInt32(chatId);
+                data.writeInt32(seqIn);
+                data.writeInt32(seqOut);
+                data.writeInt64(fillerRandomId);
+                taskId = lastTaskId.getAndAdd(1);
+                database.executeFast("SAVEPOINT rejected_secret_seq").stepThis().dispose();
+                savepoint = true;
+                SQLitePreparedStatement state = database.executeFast("REPLACE INTO pending_tasks VALUES(?, ?)");
+                state.bindLong(1, taskId);
+                state.bindByteBuffer(2, data);
+                state.step();
+                state.dispose();
                 database.executeFast("DELETE FROM messages_seq WHERE mid = " + mid).stepThis().dispose();
+                database.executeFast("RELEASE rejected_secret_seq").stepThis().dispose();
+                savepoint = false;
             } catch (Exception e) {
                 checkSQLException(e);
+                taskId = 0;
+                if (savepoint) {
+                    try {
+                        database.executeFast("ROLLBACK TO rejected_secret_seq").stepThis().dispose();
+                        database.executeFast("RELEASE rejected_secret_seq").stepThis().dispose();
+                    } catch (Exception rollbackError) {
+                        FileLog.e(rollbackError);
+                    }
+                }
+            } finally {
+                if (data != null) data.reuse();
             }
+            final long result = taskId;
+            Utilities.stageQueue.postRunnable(() -> onStored.accept(result));
+        });
+    }
+
+    // Reloads the stored sequence so a manual retry reuses a live slot or allocates a fresh one, never a filled one.
+    public void loadMessageSeqForRetry(TLRPC.Message message, Runnable onReady) {
+        storageQueue.postRunnable(() -> {
+            int seqIn = 0, seqOut = 0;
+            try {
+                SQLiteCursor cursor = database.queryFinalized("SELECT seq_in, seq_out FROM messages_seq WHERE mid = " + message.id);
+                if (cursor.next()) {
+                    seqIn = cursor.intValue(0);
+                    seqOut = cursor.intValue(1);
+                }
+                cursor.dispose();
+            } catch (Exception e) {
+                FileLog.e(e);
+                return;
+            }
+            final int storedIn = seqIn, storedOut = seqOut;
+            AndroidUtilities.runOnUIThread(() -> {
+                message.seq_in = storedIn;
+                message.seq_out = storedOut;
+                onReady.run();
+            });
         });
     }
 
